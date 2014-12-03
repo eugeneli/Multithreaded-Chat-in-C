@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <signal.h>
 
 #define MAX_BUFFER 1024
 
@@ -18,6 +19,9 @@ void chatloop(char *name, int socketFd);
 void buildMessage(char *result, char *name, char *msg);
 void setupAndConnect(struct sockaddr_in *serverAddr, struct hostent *host, int socketFd, long port);
 void setNonBlock(int fd);
+void interruptHandler(int sig);
+
+static int socketFd;
 
 int main(int argc, char *argv[])
 {
@@ -25,7 +29,6 @@ int main(int argc, char *argv[])
     struct sockaddr_in serverAddr;
     struct hostent *host;
     long port;
-    int socketFd;
 
     if(argc != 4)
     {
@@ -49,9 +52,9 @@ int main(int argc, char *argv[])
     setNonBlock(socketFd);
     setNonBlock(0);
 
-    chatloop(name, socketFd);
+    signal(SIGINT, interruptHandler);
 
-    close(socketFd);
+    chatloop(name, socketFd);
 }
 
 //Main loop to take in chat input and display output
@@ -111,7 +114,10 @@ void setupAndConnect(struct sockaddr_in *serverAddr, struct hostent *host, int s
     serverAddr->sin_addr = *((struct in_addr *)host->h_addr_list[0]);
     serverAddr->sin_port = htons(port);
     if(connect(socketFd, (struct sockaddr *) serverAddr, sizeof(struct sockaddr)) < 0)
+    {
         perror("Couldn't connect to server");
+        exit(1);
+    }
 }
 
 //Sets the fd to nonblocking
@@ -123,4 +129,14 @@ void setNonBlock(int fd)
 
     flags |= O_NONBLOCK;
     fcntl(fd, F_SETFL, flags);
+}
+
+//Notify the server when the client exits by sending "/exit"
+void interruptHandler(int sig)
+{
+    if(write(socketFd, "/exit\n", MAX_BUFFER - 1) == -1)
+        perror("write failed: ");
+
+    close(socketFd);
+    exit(1);
 }

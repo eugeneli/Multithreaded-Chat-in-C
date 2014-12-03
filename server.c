@@ -15,14 +15,11 @@
 
 #define MAX_BUFFER 1024
 
-void chatloop(int socketFd);
-void buildMessage(char *result, char *name, char *msg);
-void bindSocket(struct sockaddr_in *serverAddr, int socketFd, long port);
-
-void *newClientHandler(void *data);
-void *clientHandler(void *chv);
-void *messageHandler(void *data);
-
+/*
+Queue implementation using a char array.
+Contains a mutex for functions to lock on before modifying the array,
+and condition variables for when it's not empty or full.
+*/
 typedef struct {
     char *buffer[MAX_BUFFER];
     int head, tail;
@@ -31,6 +28,11 @@ typedef struct {
     pthread_cond_t *notFull, *notEmpty;
 } queue;
 
+/*
+Struct containing important data for the server to work.
+Namely the list of client sockets, that list's mutex,
+the server's socket for new connections, and the message queue
+*/
 typedef struct {
     fd_set serverReadFds;
     int socketFd;
@@ -40,10 +42,23 @@ typedef struct {
     queue *queue;
 } chatDataVars;
 
+/*
+Simple struct to hold the chatDataVars and the new client's socket fd.
+Used only in the client handler thread.
+*/
 typedef struct {
     chatDataVars *data;
     int clientSocketFd;
 } clientHandlerVars;
+
+void chatloop(int socketFd);
+void buildMessage(char *result, char *name, char *msg);
+void bindSocket(struct sockaddr_in *serverAddr, int socketFd, long port);
+void removeClient(chatDataVars *data, int clientSocketFd);
+
+void *newClientHandler(void *data);
+void *clientHandler(void *chv);
+void *messageHandler(void *data);
 
 void queueDestroy(queue *q);
 queue* queueInit(void);
@@ -60,12 +75,16 @@ int main(int argc, char *argv[])
 
     if((socketFd = socket(AF_INET, SOCK_STREAM, 0))== -1)
     {
-        fprintf(stderr, "Couldn't create socket\n");
+        perror("Socket creation failed");
         exit(1);
     }
 
     bindSocket(&serverAddr, socketFd, port);
-    if(listen(socketFd, 1) == -1) perror("listen failed: ");
+    if(listen(socketFd, 1) == -1)
+    {
+        perror("listen failed: ");
+        exit(1);
+    }
 
     chatloop(socketFd);
     
@@ -75,11 +94,10 @@ int main(int argc, char *argv[])
 //Main loop to take in chat input and display output
 void chatloop(int socketFd)
 {
-    queue *q = queueInit();
     chatDataVars data;
     data.numClients = 0;
     data.socketFd = socketFd;
-    data.queue = q;
+    data.queue = queueInit();
     data.clientListMutex = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
     pthread_mutex_init(data.clientListMutex, NULL);
 
@@ -103,7 +121,7 @@ void chatloop(int socketFd)
     pthread_join(connectionThread, NULL);
     pthread_join(messagesThread, NULL);
 
-    queueDestroy(q);
+    queueDestroy(data.queue);
     pthread_mutex_destroy(data.clientListMutex);
     free(data.clientListMutex);
 }
@@ -114,7 +132,7 @@ queue* queueInit(void)
     queue *q = (queue *)malloc(sizeof(queue));
     if(q == NULL)
     {
-        fprintf(stderr, "Couldn't allocate anymore memory!\n");
+        perror("Couldn't allocate anymore memory!");
         exit(EXIT_FAILURE);
     }
 
@@ -123,7 +141,7 @@ queue* queueInit(void)
     q->mutex = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
     if(q->mutex == NULL)
     {
-        fprintf(stderr, "Couldn't allocate anymore memory!\n");
+        perror("Couldn't allocate anymore memory!");
         exit(EXIT_FAILURE);
     }
     pthread_mutex_init(q->mutex, NULL);
@@ -131,7 +149,7 @@ queue* queueInit(void)
     q->notFull = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
     if(q->notFull == NULL)
     {
-        fprintf(stderr, "Couldn't allocate anymore memory!\n");
+        perror("Couldn't allocate anymore memory!");
         exit(EXIT_FAILURE);   
     }
     pthread_cond_init(q->notFull, NULL);
@@ -139,7 +157,7 @@ queue* queueInit(void)
     q->notEmpty = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
     if(q->notEmpty == NULL)
     {
-        fprintf(stderr, "Couldn't allocate anymore memory!\n");
+        perror("Couldn't allocate anymore memory!");
         exit(EXIT_FAILURE);
     }
     pthread_cond_init(q->notEmpty, NULL);
@@ -185,15 +203,6 @@ char* queuePop(queue *q)
     return msg;
 }
 
-//Concatenates the name with the message and puts it into result
-void buildMessage(char *result, char *name, char *msg)
-{
-    memset(result, 0, MAX_BUFFER);
-    strcpy(result, name);
-    strcat(result, ": ");
-    strcat(result, msg);
-}
-
 //Sets up and binds the socket
 void bindSocket(struct sockaddr_in *serverAddr, int socketFd, long port)
 {
@@ -203,10 +212,28 @@ void bindSocket(struct sockaddr_in *serverAddr, int socketFd, long port)
     serverAddr->sin_port = htons(port);
 
     if(bind(socketFd, (struct sockaddr *)serverAddr, sizeof(struct sockaddr_in)) == -1)
-        fprintf(stderr, "Bind socket failed\n");
+    {
+        perror("Socket bind failed: ");
+        exit(1);
+    }
 }
 
-//Handles new connections
+//Removes the socket from the list of active client sockets and closes it
+void removeClient(chatDataVars *data, int clientSocketFd)
+{
+    pthread_mutex_lock(data->clientListMutex);
+    for(int i = 0; i < MAX_BUFFER; i++)
+    {
+        if(data->clientSockets[i] == clientSocketFd)
+        {
+            data->clientSockets[i] = 0;
+            close(clientSocketFd);
+        }
+    }
+    pthread_mutex_unlock(data->clientListMutex);
+}
+
+//Thread to handle new connections. Adds client's fd to list of client fds and spawns a new clientHandler thread for it
 void *newClientHandler(void *data)
 {
     chatDataVars *chatData = (chatDataVars *) data;
@@ -217,6 +244,7 @@ void *newClientHandler(void *data)
         {
             fprintf(stderr, "Server accepted new client. Socket: %d\n", clientSocketFd);
 
+            //Obtain lock on clients list and add new client in
             pthread_mutex_lock(chatData->clientListMutex);
             if(chatData->numClients < MAX_BUFFER)
             {
@@ -254,24 +282,33 @@ void *clientHandler(void *chv)
     int clientSocketFd = vars->clientSocketFd;
 
     char msgBuffer[MAX_BUFFER];
-
     while(1)
     {
         int numBytesRead = read(clientSocketFd, msgBuffer, MAX_BUFFER - 1);
         msgBuffer[numBytesRead] = '\0';
 
-        pthread_mutex_lock(q->mutex);
-        while(q->full)
+        //If the client sent /exit\n, remove them from the client list and close their socket
+        if(strcmp(msgBuffer, "/exit\n") == 0)
         {
-            //printf("Message queue full");
-            pthread_cond_wait(q->notFull, q->mutex);
+            fprintf(stderr, "Client on socket %d has disconnected.\n", clientSocketFd);
+            removeClient(data, clientSocketFd);
+            return NULL;
         }
-        fprintf(stderr, "Pushing message to queue: %s\n", msgBuffer);
-        queuePush(q, msgBuffer);
-        pthread_mutex_unlock(q->mutex);
-        pthread_cond_signal(q->notEmpty);
+        else
+        {
+            //Wait for queue to not be full before pushing message
+            while(q->full)
+            {
+                pthread_cond_wait(q->notFull, q->mutex);
+            }
 
-        memset(&msgBuffer, 0, sizeof(msgBuffer));
+            //Obtain lock, push message to queue, unlock, set condition variable
+            pthread_mutex_lock(q->mutex);
+            fprintf(stderr, "Pushing message to queue: %s\n", msgBuffer);
+            queuePush(q, msgBuffer);
+            pthread_mutex_unlock(q->mutex);
+            pthread_cond_signal(q->notEmpty);
+        }
     }
 }
 
@@ -284,22 +321,23 @@ void *messageHandler(void *data)
 
     while(1)
     {
+        //Obtain lock and pop message from queue when not empty
         pthread_mutex_lock(q->mutex);
         while(q->empty)
         {
-            //printf("Message queue empty");
             pthread_cond_wait(q->notEmpty, q->mutex);
         }
         char* msg = queuePop(q);
+        pthread_mutex_unlock(q->mutex);
+        pthread_cond_signal(q->notFull);
 
+        //Broadcast message to all connected clients
         fprintf(stderr, "Broadcasting message: %s\n", msg);
         for(int i = 0; i < chatData->numClients; i++)
         {
-            if(write(clientSockets[i], msg, MAX_BUFFER - 1) == -1)
-                fprintf(stderr, "Write failed\n");
+            int socket = clientSockets[i];
+            if(socket != 0 && write(socket, msg, MAX_BUFFER - 1) == -1)
+                perror("Socket write failed: ");
         }
-
-        pthread_mutex_unlock(q->mutex);
-        pthread_cond_signal(q->notFull);
     }
 }
