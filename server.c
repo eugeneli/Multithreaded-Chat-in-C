@@ -51,7 +51,7 @@ typedef struct {
     int clientSocketFd;
 } clientHandlerVars;
 
-void chatloop(int socketFd);
+void startChat(int socketFd);
 void buildMessage(char *result, char *name, char *msg);
 void bindSocket(struct sockaddr_in *serverAddr, int socketFd, long port);
 void removeClient(chatDataVars *data, int clientSocketFd);
@@ -86,13 +86,13 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    chatloop(socketFd);
+    startChat(socketFd);
     
     close(socketFd);
 }
 
-//Main loop to take in chat input and display output
-void chatloop(int socketFd)
+//Spawns the new client handler thread and message consumer thread
+void startChat(int socketFd)
 {
     chatDataVars data;
     data.numClients = 0;
@@ -189,7 +189,7 @@ void queuePush(queue *q, char* msg)
     q->empty = 0;
 }
 
-//Get front of queue
+//Pop front of queue
 char* queuePop(queue *q)
 {
     char* msg = q->buffer[q->head];
@@ -228,6 +228,8 @@ void removeClient(chatDataVars *data, int clientSocketFd)
         {
             data->clientSockets[i] = 0;
             close(clientSocketFd);
+            data->numClients--;
+            i = MAX_BUFFER;
         }
     }
     pthread_mutex_unlock(data->clientListMutex);
@@ -249,7 +251,14 @@ void *newClientHandler(void *data)
             if(chatData->numClients < MAX_BUFFER)
             {
                 //Add new client to list
-                chatData->clientSockets[chatData->numClients] = clientSocketFd;
+                for(int i = 0; i < MAX_BUFFER; i++)
+                {
+                    if(!FD_ISSET(chatData->clientSockets[i], &(chatData->serverReadFds)))
+                    {
+                        chatData->clientSockets[i] = clientSocketFd;
+                        i = MAX_BUFFER;
+                    }
+                }
 
                 FD_SET(clientSocketFd, &(chatData->serverReadFds));
 

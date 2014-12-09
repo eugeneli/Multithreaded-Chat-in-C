@@ -52,6 +52,7 @@ int main(int argc, char *argv[])
     setNonBlock(socketFd);
     setNonBlock(0);
 
+    //Set a handler for the interrupt signal
     signal(SIGINT, interruptHandler);
 
     chatloop(name, socketFd);
@@ -86,10 +87,15 @@ void chatloop(char *name, int socketFd)
                     else if(fd == 0) //read from keyboard (stdin) and send to server
                     {
                         fgets(chatBuffer, MAX_BUFFER - 1, stdin);
-                        buildMessage(chatMsg, name, chatBuffer);
-                        if(write(socketFd, chatMsg, MAX_BUFFER - 1) == -1) perror("write failed: ");
-                        //printf("%s", chatMsg);
-                        memset(&chatBuffer, 0, sizeof(chatBuffer));
+                        if(strcmp(chatBuffer, "/exit\n") == 0)
+                            interruptHandler(-1); //Reuse the interruptHandler function to disconnect the client
+                        else
+                        {
+                            buildMessage(chatMsg, name, chatBuffer);
+                            if(write(socketFd, chatMsg, MAX_BUFFER - 1) == -1) perror("write failed: ");
+                            //printf("%s", chatMsg);
+                            memset(&chatBuffer, 0, sizeof(chatBuffer));
+                        }
                     }
                 }
             }
@@ -132,7 +138,7 @@ void setNonBlock(int fd)
 }
 
 //Notify the server when the client exits by sending "/exit"
-void interruptHandler(int sig)
+void interruptHandler(int sig_unused)
 {
     if(write(socketFd, "/exit\n", MAX_BUFFER - 1) == -1)
         perror("write failed: ");
